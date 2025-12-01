@@ -7,12 +7,13 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <stdbool.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
-#include <strings.h>
-#include <string.h>
-#include <stdbool.h>
+#include <errno.h>
+#include <stdint.h>
 
 #define SERVER_PORT 80          /**< HTTP server port */
 #define LISTEN_BACKLOG 5        /**< Maximum pending connections */
@@ -26,26 +27,31 @@
  * @note Supports operators: +, -, *, /
  */
 int calculate_query(const char* query) {
-    int a, b;
-    char op;
+    if (!query) {
+        return 0;
+    }
 
-    if(query[0] == '=') {
+    int a = 0, b = 0;
+    char op = '\0';
+
+    if (query[0] == '=') {
         query++;
     }
 
     printf("DEBUG calculate_query input: '%s'\n", query);
+
     int matched = sscanf(query, "%d%c%d", &a, &op, &b);
     printf("DEBUG sscanf matched: %d(a=%d, op=%c, b=%d)\n", matched, a, op, b);
 
-    if(matched != 3) {
+    if (matched != 3) {
         return 0;
     }
 
-    switch(op) {
+    switch (op) {
         case '+': return a + b;
         case '-': return a - b;
         case '*': return a * b;
-        case '/': return b != 0 ? a / b : 0;
+        case '/': return (b != 0) ? (a / b) : 0;
         default: return 0;
     }
 }
@@ -58,16 +64,23 @@ int calculate_query(const char* query) {
  * @note Handles percent-encoding (e.g., %20 -> space)
  */
 void url_decode(const char* src, char* dst, size_t dst_size) {
+    if (!src || !dst || dst_size == 0) {
+        return;
+    }
+
     const char* src_ptr = src;
     char* dst_ptr = dst;
     char* dst_end = dst + dst_size - 1;
 
-    while(*src_ptr && dst_ptr < dst_end) {
-        if(*src_ptr == '%' && *(src_ptr + 1) && *(src_ptr + 2)) {
-            int value;
-            sscanf(src_ptr + 1, "%2x", &value);
-            *dst_ptr++ = value;
-            src_ptr += 3;
+    while (*src_ptr && dst_ptr < dst_end) {
+        if (*src_ptr == '%' && src_ptr[1] && src_ptr[2]) {
+            unsigned int value = 0;
+            if (sscanf(src_ptr + 1, "%2x", &value) == 1) {
+                *dst_ptr++ = (char)value;
+                src_ptr += 3;
+            } else {
+                *dst_ptr++ = *src_ptr++;
+            }
         } else {
             *dst_ptr++ = *src_ptr++;
         }
@@ -84,26 +97,30 @@ void url_decode(const char* src, char* dst, size_t dst_size) {
  * @note Expects GET /calc?query=... format
  */
 bool extract_query_param(const char* request, char* query, size_t query_size) {
-    if(strncmp(request, "GET /calc?query=", 16) != 0) {
+    if (!request || !query || query_size == 0) {
         return false;
     }
 
-    const char* query_start = request + 16;
-    if(strncmp(query_start, "query=", 6) == 0) {
-        query_start += 6;
+    const char prefix[] = "GET /calc?query=";
+    const size_t prefix_len = sizeof(prefix) - 1;
+
+    if (strncmp(request, prefix, prefix_len) != 0) {
+        return false;
     }
+
+    const char* query_start = request + prefix_len;
 
     const char* query_end = strchr(query_start, ' ');
-    if(!query_end) {
+    if (!query_end) {
         return false;
     }
 
-    size_t len = query_end - query_start;
-    if(len >= query_size) {
+    size_t len = (size_t)(query_end - query_start);
+    if (len >= query_size) {
         len = query_size - 1;
     }
 
-    strncpy(query, query_start, len);
+    memcpy(query, query_start, len);
     query[len] = '\0';
 
     return true;
@@ -117,17 +134,28 @@ bool extract_query_param(const char* request, char* query, size_t query_size) {
  */
 void send_http_response(int connfd, int result) {
     char response[BUFFER_SIZE];
-    char result_str[16];
+    char result_str[32];
 
-    snprintf(result_str, sizeof(result_str), "%d", result);
-    snprintf(response, sizeof(response),
+    int len = snprintf(result_str, sizeof(result_str), "%d", result);
+    if (len < 0 || (size_t)len >= sizeof(result_str)) {
+        fprintf(stderr, "Failed to format result string\n");
+        return;
+    }
+
+    len = snprintf(response, sizeof(response),
         "HTTP/1.1 200 OK\r\n"
-        "Content-Length: %zu\r\n"
+        "Content-Length: %d\r\n"
         "\r\n"
         "%s",
-        strlen(result_str), result_str);
+        (int)strlen(result_str), result_str);
 
-    if(write(connfd, response, strlen(response)) < 0) {
+    if (len < 0 || (size_t)len >= sizeof(response)) {
+        fprintf(stderr, "Failed to format response\n");
+        return;
+    }
+
+    ssize_t written = write(connfd, response, strlen(response));
+    if (written < 0) {
         perror("write");
     }
 }
@@ -143,18 +171,18 @@ void handle_request(int connfd) {
     char decoded_query[BUFFER_SIZE];
 
     ssize_t nbytes = read(connfd, buf, sizeof(buf) - 1);
-    if(nbytes < 0) {
+    if (nbytes < 0) {
         perror("read");
         return;
     }
 
-    if(nbytes == 0) {
+    if (nbytes == 0) {
         return;
     }
 
     buf[nbytes] = '\0';
 
-    if(!extract_query_param(buf, raw_query, sizeof(raw_query))) {
+    if (!extract_query_param(buf, raw_query, sizeof(raw_query))) {
         return;
     }
 
@@ -179,35 +207,35 @@ int create_server_socket(void) {
     int listenfd;
     struct sockaddr_in servaddr;
 
-    while(1) {
+    while (true) {
         listenfd = socket(AF_INET, SOCK_STREAM, 0);
-        if(listenfd < 0) {
+        if (listenfd < 0) {
             perror("socket");
             sleep(RETRY_DELAY_SEC);
             continue;
         }
 
         int opt = 1;
-        if(setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        if (setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
             perror("setsockopt");
             close(listenfd);
             sleep(RETRY_DELAY_SEC);
             continue;
         }
 
-        bzero(&servaddr, sizeof(servaddr));
+        memset(&servaddr, 0, sizeof(servaddr));
         servaddr.sin_family = AF_INET;
         servaddr.sin_port = htons(SERVER_PORT);
         servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
 
-        if(bind(listenfd, (struct sockaddr*)&servaddr, sizeof(servaddr)) < 0) {
+        if (bind(listenfd, (struct sockaddr*)&servaddr, sizeof(servaddr)) < 0) {
             perror("bind");
             close(listenfd);
             sleep(RETRY_DELAY_SEC);
             continue;
         }
 
-        if(listen(listenfd, LISTEN_BACKLOG) < 0) {
+        if (listen(listenfd, LISTEN_BACKLOG) < 0) {
             perror("listen");
             close(listenfd);
             sleep(RETRY_DELAY_SEC);
@@ -224,9 +252,9 @@ int create_server_socket(void) {
  * @note Accepts connections in an infinite loop and handles each request
  */
 void run_server(int listenfd) {
-    while(1) {
-        int connfd = accept(listenfd, (struct sockaddr*)NULL, NULL);
-        if(connfd < 0) {
+    while (true) {
+        int connfd = accept(listenfd, NULL, NULL);
+        if (connfd < 0) {
             perror("accept");
             continue;
         }
