@@ -7,73 +7,28 @@
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <unistd.h>
-#include <strings.h>
 #include <string.h>
 #include <stdbool.h>
+#include <ctype.h>
+#include <limits.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <errno.h>
+#include <stdint.h>
+#include <signal.h>
 
-#define SERVER_PORT 80          /**< HTTP server port */
-#define LISTEN_BACKLOG 5        /**< Maximum pending connections */
-#define BUFFER_SIZE BUFSIZ      /**< Buffer size for I/O operations */
-#define RETRY_DELAY_SEC 1       /**< Retry delay in seconds on socket errors */
+#include "http_utils.h"
+#include "calculator.h"
 
-/**
- * @brief Extract and calculate mathematical expression from query string
- * @param[in] query Query string containing expression (e.g., "5+3", "10-2")
- * @return Calculated result, or 0 if parsing fails
- * @note Supports operators: +, -, *, /
- */
-int calculate_query(const char* query) {
-    int a, b;
-    char op;
-
-    if(query[0] == '=') {
-        query++;
-    }
-
-    printf("DEBUG calculate_query input: '%s'\n", query);
-    int matched = sscanf(query, "%d%c%d", &a, &op, &b);
-    printf("DEBUG sscanf matched: %d(a=%d, op=%c, b=%d)\n", matched, a, op, b);
-
-    if(matched != 3) {
-        return 0;
-    }
-
-    switch(op) {
-        case '+': return a + b;
-        case '-': return a - b;
-        case '*': return a * b;
-        case '/': return b != 0 ? a / b : 0;
-        default: return 0;
-    }
-}
-
-/**
- * @brief Decode URL-encoded string
- * @param[in] src Source URL-encoded string
- * @param[out] dst Destination buffer for decoded string
- * @param[in] dst_size Size of destination buffer
- * @note Handles percent-encoding (e.g., %20 -> space)
- */
-void url_decode(const char* src, char* dst, size_t dst_size) {
-    const char* src_ptr = src;
-    char* dst_ptr = dst;
-    char* dst_end = dst + dst_size - 1;
-
-    while(*src_ptr && dst_ptr < dst_end) {
-        if(*src_ptr == '%' && *(src_ptr + 1) && *(src_ptr + 2)) {
-            int value;
-            sscanf(src_ptr + 1, "%2x", &value);
-            *dst_ptr++ = value;
-            src_ptr += 3;
-        } else {
-            *dst_ptr++ = *src_ptr++;
-        }
-    }
-    *dst_ptr = '\0';
-}
+#define SERVER_PORT 80              /**< HTTP server port */
+#define LISTEN_BACKLOG 5            /**< Maximum pending connections */
+#define BUFFER_SIZE 8192            /**< Buffer size for I/O operations */
+#define MAX_REQUEST_SIZE 4096       /**< Maximum HTTP request size */
+#define MAX_QUERY_LEN 256           /**< Maximum query parameter length */
+#define RETRY_DELAY_SEC 1           /**< Retry delay in seconds on socket errors */
+#define SOCKET_TIMEOUT_SEC 30       /**< Socket read/write timeout */
 
 /**
  * @brief Extract query parameter from HTTP request
@@ -83,53 +38,100 @@ void url_decode(const char* src, char* dst, size_t dst_size) {
  * @return true if query parameter found, false otherwise
  * @note Expects GET /calc?query=... format
  */
-bool extract_query_param(const char* request, char* query, size_t query_size) {
-    if(strncmp(request, "GET /calc?query=", 16) != 0) {
+static bool extract_query_param(const char* request, char* query, size_t query_size) {
+    if (!request || !query || query_size == 0) {
         return false;
     }
 
-    const char* query_start = request + 16;
-    if(strncmp(query_start, "query=", 6) == 0) {
-        query_start += 6;
+    const char prefix[] = "GET /calc?query=";
+    const size_t prefix_len = sizeof(prefix) - 1;
+
+    if (strncmp(request, prefix, prefix_len) != 0) {
+        return false;
     }
 
+    const char* query_start = request + prefix_len;
+
+    // Find the end of the query (space or HTTP version marker)
     const char* query_end = strchr(query_start, ' ');
-    if(!query_end) {
+    if (!query_end) {
+        query_end = strstr(query_start, "\r\n");
+        if (!query_end) {
+            fprintf(stderr, "Malformed HTTP request\n");
+            return false;
+        }
+    }
+
+    size_t len = (size_t)(query_end - query_start);
+    if (len >= query_size) {
+        fprintf(stderr, "Query parameter too long (max %zu bytes)\n", query_size - 1);
         return false;
     }
 
-    size_t len = query_end - query_start;
-    if(len >= query_size) {
-        len = query_size - 1;
+    if (len == 0) {
+        fprintf(stderr, "Empty query parameter\n");
+        return false;
     }
 
-    strncpy(query, query_start, len);
+    memcpy(query, query_start, len);
     query[len] = '\0';
 
     return true;
 }
 
 /**
- * @brief Send HTTP response with calculation result
+ * @brief Send HTTP response with status code and optional body
  * @param[in] connfd Connected socket file descriptor
- * @param[in] result Calculation result to send
- * @note Sends HTTP/1.1 200 OK response with Content-Length header
+ * @param[in] status_code HTTP status code (e.g., 200, 400, 500)
+ * @param[in] body Response body (NULL for empty body)
+ * @return true if successful, false otherwise
  */
-void send_http_response(int connfd, int result) {
+static bool send_http_response(int connfd, int status_code, const char* body) {
     char response[BUFFER_SIZE];
-    char result_str[16];
+    const char* status_text;
 
-    snprintf(result_str, sizeof(result_str), "%d", result);
-    snprintf(response, sizeof(response),
-        "HTTP/1.1 200 OK\r\n"
+    // Map status code to text
+    switch (status_code) {
+        case 200: status_text = "OK"; break;
+        case 400: status_text = "Bad Request"; break;
+        case 500: status_text = "Internal Server Error"; break;
+        default: status_text = "Unknown"; break;
+    }
+
+    const char* response_body = body ? body : "";
+    size_t body_len = strlen(response_body);
+
+    int len = snprintf(response, sizeof(response),
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Type: text/plain\r\n"
         "Content-Length: %zu\r\n"
+        "Connection: close\r\n"
         "\r\n"
         "%s",
-        strlen(result_str), result_str);
+        status_code, status_text, body_len, response_body);
 
-    if(write(connfd, response, strlen(response)) < 0) {
-        perror("write");
+    if (len < 0 || (size_t)len >= sizeof(response)) {
+        fprintf(stderr, "Failed to format HTTP response\n");
+        return false;
     }
+
+    // Send complete response (handle partial writes)
+    size_t total_sent = 0;
+    size_t response_len = (size_t)len;
+
+    while (total_sent < response_len) {
+        ssize_t sent = write(connfd, response + total_sent, response_len - total_sent);
+        if (sent < 0) {
+            if (errno == EINTR) {
+                continue;  // Interrupted by signal, retry
+            }
+            perror("write");
+            return false;
+        }
+        total_sent += (size_t)sent;
+    }
+
+    return true;
 }
 
 /**
@@ -137,99 +139,209 @@ void send_http_response(int connfd, int result) {
  * @param[in] connfd Connected socket file descriptor
  * @note Reads request, extracts query, decodes it, calculates result, and sends response
  */
-void handle_request(int connfd) {
-    char buf[BUFFER_SIZE];
-    char raw_query[BUFFER_SIZE];
-    char decoded_query[BUFFER_SIZE];
+static void handle_request(int connfd) {
+    char buf[MAX_REQUEST_SIZE];
+    char raw_query[MAX_QUERY_LEN];
+    char decoded_query[MAX_QUERY_LEN];
+    char response_body[64];
+    int calc_result = 0;
 
+    // Set socket timeout
+    struct timeval timeout;
+    timeout.tv_sec = SOCKET_TIMEOUT_SEC;
+    timeout.tv_usec = 0;
+    if (setsockopt(connfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
+        perror("Warning: setsockopt SO_RCVTIMEO");
+    }
+
+    // Read request
     ssize_t nbytes = read(connfd, buf, sizeof(buf) - 1);
-    if(nbytes < 0) {
+    if (nbytes < 0) {
         perror("read");
+        send_http_response(connfd, 500, "Internal Server Error");
         return;
     }
 
-    if(nbytes == 0) {
-        return;
+    if (nbytes == 0) {
+        return;  // Connection closed
     }
 
     buf[nbytes] = '\0';
 
-    if(!extract_query_param(buf, raw_query, sizeof(raw_query))) {
+    // Extract query parameter
+    if (!extract_query_param(buf, raw_query, sizeof(raw_query))) {
+        send_http_response(connfd, 400, "Bad Request: Invalid query format");
         return;
     }
 
-    url_decode(raw_query, decoded_query, sizeof(decoded_query));
+    // URL decode
+    if (!url_decode(raw_query, decoded_query, sizeof(decoded_query))) {
+        send_http_response(connfd, 400, "Bad Request: Invalid URL encoding");
+        return;
+    }
 
     printf("Query(raw): %s\n", raw_query);
     printf("Query(decoded): %s\n", decoded_query);
 
-    int result = calculate_query(decoded_query);
-    printf("Result: %d\n", result);
+    // Calculate result
+    if (!calculate_query(decoded_query, &calc_result)) {
+        send_http_response(connfd, 400, "Bad Request: Invalid calculation");
+        return;
+    }
 
-    send_http_response(connfd, result);
+    printf("Result: %d\n", calc_result);
+
+    // Format and send response
+    snprintf(response_body, sizeof(response_body), "%d", calc_result);
+    send_http_response(connfd, 200, response_body);
 }
 
 /**
  * @brief Create and initialize server socket
- * @return Server socket file descriptor
- * @note Sets SO_REUSEADDR option and retries on failure with 1 second delay
- * @note Binds to all interfaces (INADDR_ANY) on SERVER_PORT
+ * @return Server socket file descriptor on success, -1 on fatal error
+ * @note Sets SO_REUSEADDR option to allow quick restart
+ * @note Binds to all interfaces (in6addr_any) on SERVER_PORT
+ * @note Supports dual-stack (IPv4 and IPv6) by disabling IPV6_V6ONLY
  */
-int create_server_socket(void) {
+static int create_server_socket(void) {
     int listenfd;
-    struct sockaddr_in servaddr;
+    struct sockaddr_in6 servaddr;
+    int retry_count = 0;
+    const int max_retries = 3;
 
-    while(1) {
-        listenfd = socket(AF_INET, SOCK_STREAM, 0);
-        if(listenfd < 0) {
+    while (retry_count < max_retries) {
+        listenfd = socket(AF_INET6, SOCK_STREAM, 0);
+        if (listenfd < 0) {
             perror("socket");
-            sleep(RETRY_DELAY_SEC);
+            retry_count++;
+            if (retry_count < max_retries) {
+                fprintf(stderr, "Retrying (%d/%d)...\n", retry_count, max_retries);
+                sleep(RETRY_DELAY_SEC);
+            }
             continue;
         }
 
+        // Enable address reuse to avoid "Address already in use" errors
         int opt = 1;
-        if(setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-            perror("setsockopt");
+        if (setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+            perror("setsockopt SO_REUSEADDR");
             close(listenfd);
-            sleep(RETRY_DELAY_SEC);
+            retry_count++;
+            if (retry_count < max_retries) {
+                fprintf(stderr, "Retrying (%d/%d)...\n", retry_count, max_retries);
+                sleep(RETRY_DELAY_SEC);
+            }
             continue;
         }
 
-        bzero(&servaddr, sizeof(servaddr));
-        servaddr.sin_family = AF_INET;
-        servaddr.sin_port = htons(SERVER_PORT);
-        servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
+        // Disable IPV6_V6ONLY to enable dual-stack (accept both IPv4 and IPv6)
+        int v6only = 0;
+        if (setsockopt(listenfd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only)) < 0) {
+            perror("setsockopt IPV6_V6ONLY");
+            close(listenfd);
+            retry_count++;
+            if (retry_count < max_retries) {
+                fprintf(stderr, "Retrying (%d/%d)...\n", retry_count, max_retries);
+                sleep(RETRY_DELAY_SEC);
+            }
+            continue;
+        }
 
-        if(bind(listenfd, (struct sockaddr*)&servaddr, sizeof(servaddr)) < 0) {
+        // Build server address structure
+        memset(&servaddr, 0, sizeof(servaddr));
+        servaddr.sin6_family = AF_INET6;
+        servaddr.sin6_port = htons(SERVER_PORT);
+        servaddr.sin6_addr = in6addr_any;
+
+        // Bind socket to address
+        if (bind(listenfd, (const struct sockaddr*)&servaddr, sizeof(servaddr)) < 0) {
             perror("bind");
             close(listenfd);
-            sleep(RETRY_DELAY_SEC);
+            retry_count++;
+            if (retry_count < max_retries) {
+                fprintf(stderr, "Retrying (%d/%d)...\n", retry_count, max_retries);
+                sleep(RETRY_DELAY_SEC);
+            }
             continue;
         }
 
-        if(listen(listenfd, LISTEN_BACKLOG) < 0) {
+        // Start listening for connections
+        if (listen(listenfd, LISTEN_BACKLOG) < 0) {
             perror("listen");
             close(listenfd);
-            sleep(RETRY_DELAY_SEC);
+            retry_count++;
+            if (retry_count < max_retries) {
+                fprintf(stderr, "Retrying (%d/%d)...\n", retry_count, max_retries);
+                sleep(RETRY_DELAY_SEC);
+            }
             continue;
         }
 
         return listenfd;
+    }
+
+    fprintf(stderr, "Failed to create server socket after %d retries\n", max_retries);
+    return -1;
+}
+
+// Global flag for graceful shutdown
+static volatile sig_atomic_t server_running = 1;
+
+/**
+ * @brief Signal handler for graceful shutdown
+ * @param[in] signum Signal number
+ */
+static void signal_handler(int signum) {
+    if (signum == SIGINT || signum == SIGTERM) {
+        printf("\nReceived signal %d, shutting down gracefully...\n", signum);
+        server_running = 0;
     }
 }
 
 /**
  * @brief Main server event loop
  * @param[in] listenfd Listening socket file descriptor
- * @note Accepts connections in an infinite loop and handles each request
+ * @note Accepts connections in a loop and handles each request
+ * @note Supports graceful shutdown via SIGINT/SIGTERM
+ * @note Handles both IPv4 and IPv6 client connections
  */
-void run_server(int listenfd) {
-    while(1) {
-        int connfd = accept(listenfd, (struct sockaddr*)NULL, NULL);
-        if(connfd < 0) {
+static void run_server(int listenfd) {
+    struct sockaddr_storage client_addr;
+    socklen_t client_len;
+
+    while (server_running) {
+        client_len = sizeof(client_addr);
+        int connfd = accept(listenfd, (struct sockaddr*)&client_addr, &client_len);
+
+        if (connfd < 0) {
+            if (errno == EINTR) {
+                // Interrupted by signal, check if we should continue
+                continue;
+            }
             perror("accept");
             continue;
         }
+
+        // Log client connection (handle both IPv4 and IPv6)
+        char client_ip[INET6_ADDRSTRLEN];
+        uint16_t client_port;
+
+        if (client_addr.ss_family == AF_INET) {
+            // IPv4
+            struct sockaddr_in *addr_in = (struct sockaddr_in*)&client_addr;
+            inet_ntop(AF_INET, &addr_in->sin_addr, client_ip, sizeof(client_ip));
+            client_port = ntohs(addr_in->sin_port);
+        } else if (client_addr.ss_family == AF_INET6) {
+            // IPv6
+            struct sockaddr_in6 *addr_in6 = (struct sockaddr_in6*)&client_addr;
+            inet_ntop(AF_INET6, &addr_in6->sin6_addr, client_ip, sizeof(client_ip));
+            client_port = ntohs(addr_in6->sin6_port);
+        } else {
+            snprintf(client_ip, sizeof(client_ip), "unknown");
+            client_port = 0;
+        }
+
+        printf("Connection from %s:%u\n", client_ip, client_port);
 
         handle_request(connfd);
         close(connfd);
@@ -238,13 +350,45 @@ void run_server(int listenfd) {
 
 /**
  * @brief Main function
- * @return EXIT_SUCCESS on normal termination
- * @note Creates server socket and starts event loop
+ * @return EXIT_SUCCESS on normal termination, EXIT_FAILURE on error
+ * @note Creates server socket, sets up signal handlers, and starts event loop
  */
 int main(void) {
+    // Set up signal handlers for graceful shutdown
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+
+    if (sigaction(SIGINT, &sa, NULL) < 0) {
+        perror("sigaction SIGINT");
+        return EXIT_FAILURE;
+    }
+
+    if (sigaction(SIGTERM, &sa, NULL) < 0) {
+        perror("sigaction SIGTERM");
+        return EXIT_FAILURE;
+    }
+
+    // Ignore SIGPIPE to prevent server crash when client disconnects
+    signal(SIGPIPE, SIG_IGN);
+
+    // Create and configure server socket
     int listenfd = create_server_socket();
+    if (listenfd < 0) {
+        fprintf(stderr, "Failed to create server socket\n");
+        return EXIT_FAILURE;
+    }
+
     printf("Server listening on port %d\n", SERVER_PORT);
+    printf("Press Ctrl+C to stop the server\n");
+
+    // Run server event loop
     run_server(listenfd);
+
+    // Cleanup
     close(listenfd);
+    printf("Server shutdown complete\n");
     return EXIT_SUCCESS;
 }

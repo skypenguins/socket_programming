@@ -1,111 +1,119 @@
-# Socket Programming - HTTP Server & Client
+# Socket Programming - HTTP Client/Server
 
-このディレクトリには、C言語で実装されたシンプルなHTTPサーバーとクライアントのソケットプログラミング実装が含まれています。
+C言語によるシンプルなHTTPクライアント・サーバーの実装。IPv4/IPv6デュアルスタックに対応。
 
 ## ファイル構成
 
-- [http_server.c](http_server.c) - HTTPサーバー実装（計算機能付き）
-- [http_client.c](http_client.c) - HTTPクライアント実装
-- `http_server` - コンパイル済みサーバー実行ファイル
-- `http_client` - コンパイル済みクライアント実行ファイル
+```
+socket_programming/
+├── http_server.c      # HTTPサーバー実装
+├── http_client.c      # HTTPクライアント実装
+├── calculator.c       # 計算機能の実装
+├── calculator.h       # 計算機能のヘッダー
+├── http_utils.c       # HTTPユーティリティ関数の実装
+├── http_utils.h       # HTTPユーティリティ関数の宣言
+├── Makefile           # ビルドシステム
+└── README.md          # このファイル
+```
 
-## HTTPサーバー ([http_server.c](http_server.c))
+### モジュール構成
 
-ポート80で動作する簡易HTTPサーバー。計算機能を提供します。
+- **calculator.c/h**: 計算機能のコア実装
+  - `validate_query()`: クエリ文字列の検証（長さ制限、不正文字チェック）
+  - `calculate_query()`: 数式の解析と計算実行
+  - 四則演算のサポート（+, -, *, /）
+  - 整数オーバーフローチェック、ゼロ除算防止
 
-### 主な機能
+- **http_utils.c/h**: HTTPユーティリティ関数
+  - `url_decode()`: URLデコード
+  - その他HTTPリクエスト処理に必要な機能
 
-- **計算API**: `/calc?query=`エンドポイントで四則演算を実行
-  - サポートする演算子: `+`, `-`, `*`, `/`
-  - URLエンコードされたクエリをデコード
-  - 計算結果をHTTPレスポンスとして返却
+## 特徴
 
-### 使用例
+### HTTPサーバー ([http_server.c](http_server.c))
+
+- **計算機能**: HTTP GET リクエストで数式を計算（`/calc?query=`エンドポイント）
+- **セキュリティ強化**:
+  - 入力検証（バッファオーバーフロー対策）
+  - 整数オーバーフローチェック
+  - URLデコードの厳密な検証
+- **適切なHTTPレスポンス**: ステータスコード付き（200, 400, 500）
+- **グレースフルシャットダウン**: SIGINT/SIGTERMハンドリング
+- **クライアント情報ロギング**: 接続元IPアドレスとポートの記録
+- **SIGPIPE対策**: クライアント切断時のクラッシュ防止
+
+### HTTPクライアント ([http_client.c](http_client.c))
+
+- **モダンAPI使用**: `getaddrinfo()`を使用した名前解決
+- **堅牢なエラーハンドリング**: 適切なエラーチェックとリソース管理
+- **部分送受信対応**: 部分的なwrite/readへの対応
+- **タイムアウト設定**: ソケットタイムアウトによるハング防止
+- **入力検証**: メッセージ長の制限
+
+## ビルド方法
 
 ```bash
-# サーバーを起動（ポート80なのでroot権限が必要）
+# すべてビルド
+make
+
+# デバッグビルド（AddressSanitizer有効）
+make DEBUG=1
+
+# クリーンビルド
+make rebuild
+```
+
+## 実行方法
+
+### サーバーの起動
+
+```bash
+# ポート80を使用するため、root権限が必要
 sudo ./http_server
-
-# curlでアクセス
-curl "http://localhost/calc?query=5+3"  # 結果: 8
-curl "http://localhost/calc?query=10-4"  # 結果: 6
-curl "http://localhost/calc?query=6*7"  # 結果: 42
-curl "http://localhost/calc?query=20/4"  # 結果: 5
 ```
 
-### 実装の特徴
-
-- ソケット作成時に`SO_REUSEADDR`オプションを設定し、即座の再起動を可能に
-- 接続失敗時は自動リトライ（1秒間隔）
-- URLデコード処理を実装
-- シンプルなHTTP/1.1レスポンス生成
-
-## HTTPクライアント ([http_client.c](http_client.c))
-
-指定したサーバーにTCP接続してメッセージを送受信するクライアント。
-
-### 使用方法
+または
 
 ```bash
-./http_client [server] [port] [message]
+make run-server
 ```
 
-### パラメータ
-
-- `server`: 接続先サーバー名またはIPアドレス（デフォルト: localhost）
-- `port`: ポート名またはサービス名（デフォルト: http）
-- `message`: 送信するメッセージ（デフォルト: "Hello, world!"）
-
-### 使用例
+### クライアントの実行
 
 ```bash
 # デフォルト設定で実行
 ./http_client
 
-# 特定のサーバーに接続
-./http_client example.com http "GET / HTTP/1.1"
-
-# IPアドレスとポート番号を指定
-./http_client 192.168.1.100 8080 "test message"
+# サーバー、ポート、メッセージを指定
+./http_client localhost http "GET /calc?query=2%2b11 HTTP/1.1"
 ```
 
-### 実装の特徴
-
-- `getservbyname()`でサービス名からポート番号を解決
-- `gethostbyname()`でホスト名からIPアドレスを解決
-- IPアドレス直接指定にも対応（`inet_addr()`と`gethostbyaddr()`を使用）
-- 構造化されたエラーハンドリング
-
-## コンパイル方法
+または
 
 ```bash
-# サーバーのコンパイル
-gcc -o http_server http_server.c
-
-# クライアントのコンパイル
-gcc -o http_client http_client.c
+make run-client
 ```
 
-## 技術的詳細
+## 使用例
 
-### サーバー ([http_server.c](http_server.c))
+### 計算機能のテスト
 
-- **ソケットAPI**: `socket()`, `bind()`, `listen()`, `accept()`
-- **ポート**: 80（HTTPデフォルト）
-- **バックログ**: 5接続
-- **リクエスト処理**: 同期的に1接続ずつ処理
-- **HTTPメソッド**: GET `/calc?query=` のみ対応
+```bash
+# curlを使用した例
+curl -G --data-urlencode "query=2+10" localhost/calc
+# 結果: 12
+```
 
-### クライアント ([http_client.c](http_client.c))
+## コード品質
 
-- **ソケットAPI**: `socket()`, `connect()`
-- **名前解決**: `getservbyname()`, `gethostbyname()`, `gethostbyaddr()`
-- **アドレスファミリ**: AF_INET (IPv4)
-- **プロトコル**: TCP (SOCK_STREAM)
+### コンパイラ警告
+- `-Wall -Wextra -Werror`: すべての警告を有効化しエラーとして扱う
+- C17標準準拠 (`-std=c17`)
+- セキュリティ関連の警告を有効化
 
-## 注意事項
+### 静的解析
 
-- サーバーはポート80を使用するため、root権限が必要です
-- 本実装は教育目的のシンプルな例であり、プロダクション環境での使用は想定していません
-- エラーハンドリングは基本的なもののみ実装
-- サーバーは単一スレッドで動作するため、同時接続は処理できません
+```bash
+# clang-tidyによる静的解析
+make analyze
+```
