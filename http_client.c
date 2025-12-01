@@ -46,22 +46,25 @@ static bool parse_arguments(int argc, char *argv[], client_config_t *config) {
         return false;
     }
 
+    // デフォルト値の設定
     config->server_name = DEFAULT_SERVER;
     config->port_name = DEFAULT_PORT;
     config->message = DEFAULT_MESSAGE;
 
+    // 引数のパースとバリデーション
     if (argc >= 2) {
         config->server_name = argv[1];
-        if (argc >= 3) {
-            config->port_name = argv[2];
-            if (argc >= 4) {
-                config->message = argv[3];
-                if (strlen(argv[3]) > MAX_MESSAGE_LEN) {
-                    fprintf(stderr, "Error: Message too long (max %d bytes)\n", MAX_MESSAGE_LEN);
-                    return false;
-                }
-            }
+    }
+    if (argc >= 3) {
+        config->port_name = argv[2];
+    }
+    if (argc >= 4) {
+        // メッセージ長チェックを先に行う
+        if (strlen(argv[3]) >= MAX_MESSAGE_LEN) {
+            fprintf(stderr, "Error: Message too long (max %d bytes)\n", MAX_MESSAGE_LEN - 1);
+            return false;
         }
+        config->message = argv[3];
     }
 
     return true;

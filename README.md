@@ -6,21 +6,27 @@ C言語によるシンプルなHTTPクライアント・サーバーの実装。
 
 ```
 socket_programming/
+├── http_server.c      # HTTPサーバー実装
 ├── http_client.c      # HTTPクライアント実装
-├── http_server.c      # HTTPサーバー実装（ユーティリティ関数も実装）
-├── common.h           # 共通定義（マクロとインクルード）
+├── calculator.c       # 計算機能の実装
+├── calculator.h       # 計算機能のヘッダー
+├── http_utils.c       # HTTPユーティリティ関数の実装
 ├── http_utils.h       # HTTPユーティリティ関数の宣言
 ├── Makefile           # ビルドシステム
 └── README.md          # このファイル
 ```
 
-### ヘッダーファイルの役割
+### モジュール構成
 
-- **common.h**: 共通の定数定義とインクルード（実装は含まない）
-- **http_utils.h**: 再利用可能なHTTPユーティリティ関数の宣言
+- **calculator.c/h**: 計算機能のコア実装
+  - `validate_query()`: クエリ文字列の検証（長さ制限、不正文字チェック）
+  - `calculate_query()`: 数式の解析と計算実行
+  - 四則演算のサポート（+, -, *, /）
+  - 整数オーバーフローチェック、ゼロ除算防止
+
+- **http_utils.c/h**: HTTPユーティリティ関数
   - `url_decode()`: URLデコード
-  - `validate_query()`: クエリ検証
-  - `calculate_query()`: 計算処理
+  - その他HTTPリクエスト処理に必要な機能
 
 ## 特徴
 
@@ -79,7 +85,7 @@ make run-server
 ./http_client
 
 # サーバー、ポート、メッセージを指定
-./http_client localhost 80 "GET /calc?query=5+3 HTTP/1.1"
+./http_client localhost http "GET /calc?query=2%2b11 HTTP/1.1"
 ```
 
 または
