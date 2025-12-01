@@ -19,9 +19,10 @@
 #include <errno.h>
 
 #define DEFAULT_MESSAGE "Hello, world!" /**< Default message to send */
-#define DEFAULT_PORT "http"             /**< Default port (service name) */
+#define DEFAULT_PORT "80"               /**< Default port number */
 #define DEFAULT_SERVER "localhost"      /**< Default server address */
-#define BUFFER_SIZE BUFSIZ              /**< Buffer size for communication */
+#define BUFFER_SIZE 8192                /**< Buffer size for communication */
+#define MAX_MESSAGE_LEN 4096            /**< Maximum message length */
 
 /**
  * @struct client_config_t
@@ -38,10 +39,11 @@ typedef struct {
  * @param[in] argc Argument count
  * @param[in] argv Argument vector
  * @param[out] config Pointer to client configuration structure
+ * @return true if arguments are valid, false otherwise
  */
-void parse_arguments(int argc, char *argv[], client_config_t *config) {
+static bool parse_arguments(int argc, char *argv[], client_config_t *config) {
     if (!config) {
-        return;
+        return false;
     }
 
     config->server_name = DEFAULT_SERVER;
@@ -54,97 +56,76 @@ void parse_arguments(int argc, char *argv[], client_config_t *config) {
             config->port_name = argv[2];
             if (argc >= 4) {
                 config->message = argv[3];
+                if (strlen(argv[3]) > MAX_MESSAGE_LEN) {
+                    fprintf(stderr, "Error: Message too long (max %d bytes)\n", MAX_MESSAGE_LEN);
+                    return false;
+                }
             }
         }
     }
-}
 
-/**
- * @brief Resolve port number from service name
- * @param[in] portname Port name or service name (e.g., "http", "80")
- * @param[out] port Pointer to store resolved port number
- * @return true if successful, false otherwise
- */
-bool resolve_port(const char *portname, uint16_t *port) {
-    if (!portname || !port) {
-        return false;
-    }
-
-    struct servent *serv = getservbyname(portname, "tcp");
-    if (serv == NULL) {
-        perror("getservbyname");
-        return false;
-    }
-    *port = (uint16_t)serv->s_port;
     return true;
 }
 
 /**
- * @brief Resolve hostname to IP address
- * @param[in] servername Server hostname or IP address string
- * @param[out] addr Pointer to store resolved IP address
+ * @brief Resolve hostname and service using getaddrinfo
+ * @param[in] hostname Server hostname or IP address
+ * @param[in] service Port number or service name (e.g., "http", "80")
+ * @param[out] result Pointer to store address info list (caller must free with freeaddrinfo)
  * @return true if successful, false otherwise
  */
-bool resolve_host(const char *servername, struct in_addr *addr) {
-    if (!servername || !addr) {
+static bool resolve_address(const char *hostname, const char *service, struct addrinfo **result) {
+    if (!hostname || !service || !result) {
+        fprintf(stderr, "Error: Invalid arguments to resolve_address\n");
         return false;
     }
 
-    struct hostent *servhost = gethostbyname(servername);
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;      // IPv4 or IPv6
+    hints.ai_socktype = SOCK_STREAM;  // TCP
+    hints.ai_protocol = IPPROTO_TCP;
 
-    if (servhost == NULL) {
-        in_addr_t ip_addr = inet_addr(servername);
-        if (ip_addr == INADDR_NONE) {
-            perror("gethostbyname");
-            return false;
-        }
-        servhost = gethostbyaddr((const void *)&ip_addr, sizeof(ip_addr), AF_INET);
-        if (servhost == NULL) {
-            perror("gethostbyaddr");
-            return false;
-        }
+    int status = getaddrinfo(hostname, service, &hints, result);
+    if (status != 0) {
+        fprintf(stderr, "Error: getaddrinfo: %s\n", gai_strerror(status));
+        return false;
     }
 
-    memcpy(addr, servhost->h_addr, (size_t)servhost->h_length);
     return true;
-}
-
-/**
- * @brief Build server socket address structure
- * @param[out] servaddr Pointer to server address structure
- * @param[in] host_addr Pointer to resolved host address
- * @param[in] port Port number in network byte order
- */
-void build_server_address(struct sockaddr_in *servaddr,
-                          const struct in_addr *host_addr,
-                          uint16_t port) {
-    if (!servaddr || !host_addr) {
-        return;
-    }
-
-    memset(servaddr, 0, sizeof(*servaddr));
-    servaddr->sin_family = AF_INET;
-    servaddr->sin_port = port;
-    servaddr->sin_addr = *host_addr;
 }
 
 /**
  * @brief Create socket and connect to server
- * @param[in] servaddr Pointer to server address structure
+ * @param[in] addr_info Address info structure from getaddrinfo
  * @return Socket file descriptor on success, -1 on failure
  */
-int connect_to_server(const struct sockaddr_in *servaddr) {
-    if (!servaddr) {
+static int connect_to_server(const struct addrinfo *addr_info) {
+    if (!addr_info) {
+        fprintf(stderr, "Error: Invalid address info\n");
         return -1;
     }
 
-    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    int sockfd = socket(addr_info->ai_family, addr_info->ai_socktype, addr_info->ai_protocol);
     if (sockfd < 0) {
         perror("socket");
         return -1;
     }
 
-    if (connect(sockfd, (const struct sockaddr *)servaddr, sizeof(*servaddr)) < 0) {
+    // Set socket timeout for better error handling
+    struct timeval timeout;
+    timeout.tv_sec = 10;
+    timeout.tv_usec = 0;
+
+    if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
+        perror("Warning: setsockopt SO_RCVTIMEO");
+    }
+
+    if (setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) < 0) {
+        perror("Warning: setsockopt SO_SNDTIMEO");
+    }
+
+    if (connect(sockfd, addr_info->ai_addr, addr_info->ai_addrlen) < 0) {
         perror("connect");
         close(sockfd);
         return -1;
@@ -154,38 +135,65 @@ int connect_to_server(const struct sockaddr_in *servaddr) {
 }
 
 /**
- * @brief Send message to server and receive response
+ * @brief Send complete message to server (handles partial writes)
  * @param[in] sockfd Socket file descriptor
  * @param[in] message Message string to send
- * @param[out] response Buffer to store response
- * @param[in] response_size Size of response buffer
  * @return true if successful, false otherwise
  */
-bool send_and_receive(int sockfd, const char *message, char *response, size_t response_size) {
-    if (!message || !response || response_size == 0) {
+static bool send_message(int sockfd, const char *message) {
+    if (!message) {
+        fprintf(stderr, "Error: Invalid message\n");
         return false;
     }
 
-    size_t msg_len = strlen(message) + 1;
-    ssize_t nbytes = write(sockfd, message, msg_len);
-    if (nbytes < 0) {
-        perror("write");
-        return false;
+    size_t msg_len = strlen(message);
+    size_t total_sent = 0;
+
+    while (total_sent < msg_len) {
+        ssize_t sent = write(sockfd, message + total_sent, msg_len - total_sent);
+        if (sent < 0) {
+            if (errno == EINTR) {
+                continue;  // Interrupted by signal, retry
+            }
+            perror("write");
+            return false;
+        }
+        total_sent += (size_t)sent;
     }
 
-    nbytes = read(sockfd, response, response_size - 1);
+    return true;
+}
+
+/**
+ * @brief Receive response from server
+ * @param[in] sockfd Socket file descriptor
+ * @param[out] response Buffer to store response
+ * @param[in] response_size Size of response buffer
+ * @return Number of bytes received on success, -1 on error, 0 on connection close
+ */
+static ssize_t receive_response(int sockfd, char *response, size_t response_size) {
+    if (!response || response_size == 0) {
+        fprintf(stderr, "Error: Invalid response buffer\n");
+        return -1;
+    }
+
+    ssize_t nbytes = read(sockfd, response, response_size - 1);
     if (nbytes < 0) {
-        perror("read");
-        return false;
+        if (errno == EINTR) {
+            fprintf(stderr, "Warning: read interrupted by signal\n");
+        } else {
+            perror("read");
+        }
+        return -1;
     }
 
     if (nbytes == 0) {
         fprintf(stderr, "Connection closed by server\n");
-        return false;
+        return 0;
     }
 
     response[nbytes] = '\0';
-    return true;
+    return nbytes;
 }
 
 /**
@@ -196,32 +204,58 @@ bool send_and_receive(int sockfd, const char *message, char *response, size_t re
  */
 int main(int argc, char *argv[]) {
     client_config_t config;
-    struct sockaddr_in servaddr;
-    struct in_addr host_addr;
-    uint16_t port;
+    struct addrinfo *addr_list = NULL;
+    int sockfd = -1;
+    int exit_code = EXIT_FAILURE;
     char buf[BUFFER_SIZE];
 
-    parse_arguments(argc, argv, &config);
-
-    if (!resolve_port(config.port_name, &port)) {
+    // Parse command line arguments
+    if (!parse_arguments(argc, argv, &config)) {
+        fprintf(stderr, "Usage: %s [server] [port] [message]\n", argv[0]);
         return EXIT_FAILURE;
     }
 
-    if (!resolve_host(config.server_name, &host_addr)) {
-        return EXIT_FAILURE;
+    // Resolve server address
+    if (!resolve_address(config.server_name, config.port_name, &addr_list)) {
+        goto cleanup;
     }
 
-    build_server_address(&servaddr, &host_addr, port);
+    // Try connecting to the resolved addresses
+    for (struct addrinfo *addr = addr_list; addr != NULL; addr = addr->ai_next) {
+        sockfd = connect_to_server(addr);
+        if (sockfd >= 0) {
+            break;  // Successfully connected
+        }
+    }
 
-    int sockfd = connect_to_server(&servaddr);
     if (sockfd < 0) {
-        return EXIT_FAILURE;
+        fprintf(stderr, "Error: Failed to connect to %s:%s\n",
+                config.server_name, config.port_name);
+        goto cleanup;
     }
 
-    if (send_and_receive(sockfd, config.message, buf, sizeof(buf))) {
-        puts(buf);
+    // Send message
+    if (!send_message(sockfd, config.message)) {
+        fprintf(stderr, "Error: Failed to send message\n");
+        goto cleanup;
     }
 
-    close(sockfd);
-    return EXIT_SUCCESS;
+    // Receive response
+    ssize_t received = receive_response(sockfd, buf, sizeof(buf));
+    if (received > 0) {
+        printf("Received %zd bytes:\n%s\n", received, buf);
+        exit_code = EXIT_SUCCESS;
+    } else {
+        fprintf(stderr, "Error: Failed to receive response\n");
+    }
+
+cleanup:
+    if (sockfd >= 0) {
+        close(sockfd);
+    }
+    if (addr_list != NULL) {
+        freeaddrinfo(addr_list);
+    }
+
+    return exit_code;
 }
