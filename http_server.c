@@ -290,10 +290,12 @@ static volatile sig_atomic_t server_running = 1;
 /**
  * @brief Signal handler for graceful shutdown
  * @param[in] signum Signal number
+ * @note Uses only async-signal-safe functions: write, sig_atomic_t
  */
 static void signal_handler(int signum) {
     if (signum == SIGINT || signum == SIGTERM) {
-        printf("\nReceived signal %d, shutting down gracefully...\n", signum);
+        const char msg[] = "\nReceived signal, shutting down gracefully...\n";
+        write(STDOUT_FILENO, msg, sizeof(msg) - 1);  // ヌル文字を除いた長さ
         server_running = 0;
     }
 }
